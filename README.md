@@ -8,7 +8,7 @@ The system combines document processing, information retrieval, and Large Langua
 
 ## Live Application
 
-[Research Paper AI - Live Demo](YOUR_RENDER_URL)
+[Research Paper AI - Live Demo](https://research-paper-ai-online.onrender.com/)
 
 Upload a research paper and interact with it through the conversational interface.
 
