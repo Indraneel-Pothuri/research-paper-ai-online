@@ -18,7 +18,6 @@ import re
 from pathlib import Path
 
 import fitz
-from sentence_transformers import SentenceTransformer
 
 
 # ============================================================
@@ -299,53 +298,14 @@ def main():
         return
 
     # ========================================================
-    # EMBEDDINGS
-    # ========================================================
-
-    print(
-        "\nLoading embedding model..."
-    )
-
-    model = SentenceTransformer(
-        EMBEDDING_MODEL_NAME
-    )
-
-    print(
-        "Embedding model loaded."
-    )
-
-    texts = [
-        item["text"]
-        for item in all_chunks
-    ]
-
-    print(
-        f"\nGenerating embeddings for "
-        f"{len(texts)} chunks..."
-    )
-
-    embeddings = model.encode(
-        texts,
-        batch_size=32,
-        show_progress_bar=True,
-        normalize_embeddings=True,
-    )
-
-    # ========================================================
     # SAVE
     # ========================================================
 
-    for item, embedding in zip(
-        all_chunks,
-        embeddings,
-    ):
-
-        item["embedding"] = (
-            embedding.tolist()
-        )
+    for item in all_chunks:
+        item["embedding"] = []
 
     print(
-        "\nSaving embeddings..."
+        "\nSaving chunks..."
     )
 
     with OUTPUT_FILE.open(
