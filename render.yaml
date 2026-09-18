@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: research-paper-ai
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-20b
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        value: openrouter/free
+      - key: EMBEDDINGS_FILE
+        value: data/processed/research_embeddings.json
+      - key: EMBEDDING_MODEL
+        value: all-MiniLM-L6-v2
+      - key: TOP_K
+        value: "6"
+      - key: RETRIEVAL_K
+        value: "20"
+      - key: MIN_SIMILARITY
+        value: "0.12"
+      - key: MAX_HISTORY_TURNS
+        value: "6"
+      - key: MAX_TOKENS
+        value: "1200"
+      - key: TEMPERATURE
+        value: "0.2"
+      - key: TRANSIENT_RETRIES
+        value: "1"
+      - key: MAX_UPLOAD_BYTES
+        value: "52428800"
