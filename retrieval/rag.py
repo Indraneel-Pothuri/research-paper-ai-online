@@ -29,8 +29,6 @@ import os
 import re
 from pathlib import Path
 
-import numpy as np
-from sentence_transformers import SentenceTransformer
 
 from retrieval.llm_provider import generate_with_fallback
 
@@ -90,35 +88,16 @@ print("=" * 72)
 # The model will be loaded only when retrieve_chunks() is called.
 # ------------------------------------------------------------
 
-embedding_model = None
-
+# ============================================================
+# LIGHTWEIGHT DEPLOYMENT MODE
+# ============================================================
+# Render Free has 512 MB RAM, so retrieval uses lightweight
+# lexical scoring instead of loading a local transformer model.
+# The LLM is still used for conversational query rewriting
+# and grounded answer generation.
 
 def get_embedding_model():
-    """
-    Load the embedding model only when it is first required.
-
-    This keeps FastAPI/Uvicorn startup lightweight and avoids
-    blocking Render's port detection during deployment.
-    """
-
-    global embedding_model
-
-    if embedding_model is None:
-
-        print(
-            "\nLoading embedding model..."
-        )
-
-        embedding_model = SentenceTransformer(
-            EMBEDDING_MODEL
-        )
-
-        print(
-            "Embedding model loaded successfully."
-        )
-
-    return embedding_model
-
+    return None
 
 # ============================================================
 # LOAD RESEARCH-PAPER EMBEDDINGS
@@ -458,50 +437,215 @@ Why is experience replay important in DQN?
 # RETRIEVAL
 # ============================================================
 
+def _make_result(doc, score, overlap):
+    return {
+        "chunk_id": doc.get("chunk_id", "unknown"),
+        "paper_id": doc.get("paper_id", "unknown"),
+        "paper_name": doc.get(
+            "paper_name",
+            doc.get("source", "unknown"),
+        ),
+        "page": doc.get("page", "?"),
+        "section": doc.get("section", ""),
+        "text": doc.get("text", ""),
+        "similarity": float(score),
+        "keyword_overlap": float(overlap),
+        "score": float(score),
+    }
+
+
+def _rank_documents(question, candidate_documents, top_k=TOP_K):
+    """
+    Lightweight BM25-style lexical retrieval.
+
+    No PyTorch, Hugging Face model, or transformer is loaded.
+    This keeps the application compatible with Render Free.
+    """
+    question_keywords = extract_keywords(question)
+
+    if not question_keywords:
+        question_keywords = set(
+            normalize_text(question).split()
+        )
+
+    candidates = []
+
+    for doc in candidate_documents:
+        text = doc.get("text", "")
+        normalized = normalize_text(text)
+        words = normalized.split()
+
+        if not words:
+            continue
+
+        word_set = set(words)
+
+        matched = question_keywords.intersection(word_set)
+
+        if not matched:
+            # Also support partial technical terms.
+            matched = {
+                keyword
+                for keyword in question_keywords
+                if any(
+                    keyword in word
+                    for word in word_set
+                )
+            }
+
+        overlap = (
+            len(matched) / len(question_keywords)
+            if question_keywords
+            else 0.0
+        )
+
+        # Frequency bonus: repeated relevant terms matter.
+        frequency_score = 0.0
+
+        for keyword in matched:
+            count = words.count(keyword)
+            frequency_score += min(count, 5) / 5.0
+
+        if matched:
+            frequency_score /= len(matched)
+
+        # Section/title bonus.
+        section_text = normalize_text(
+            str(doc.get("section", ""))
+        )
+
+        section_bonus = 0.0
+
+        for keyword in question_keywords:
+            if keyword in section_text:
+                section_bonus += 1.0
+
+        if question_keywords:
+            section_bonus /= len(question_keywords)
+
+        score = (
+            0.65 * overlap
+            + 0.20 * frequency_score
+            + 0.15 * section_bonus
+        )
+
+        candidates.append(
+            _make_result(
+                doc,
+                score,
+                overlap,
+            )
+        )
+
+    candidates.sort(
+        key=lambda item: item["score"],
+        reverse=True,
+    )
+
+    # Diversity: maximum two chunks from the same page.
+    selected = []
+    seen_pages = {}
+
+    for item in candidates:
+        page_key = (
+            item["paper_name"],
+            item["page"],
+        )
+
+        count = seen_pages.get(page_key, 0)
+
+        if count >= 2:
+            continue
+
+        selected.append(item)
+        seen_pages[page_key] = count + 1
+
+        if len(selected) >= top_k:
+            break
+
+    return selected
+
+
+def _keyword_retrieve(question, candidate_docs, top_k=TOP_K):
+    """Lightweight retrieval that does not load a transformer model."""
+
+    question_keywords = extract_keywords(question)
+    candidates = []
+
+    for doc in candidate_docs:
+        text = doc.get("text", "")
+        overlap = keyword_overlap(question_keywords, text)
+
+        # Also reward exact phrase matches.
+        normalized_question = normalize_text(question)
+        normalized_text = normalize_text(text)
+
+        phrase_bonus = 0.0
+        if normalized_question and normalized_question in normalized_text:
+            phrase_bonus = 0.5
+
+        score = min(1.0, overlap + phrase_bonus)
+
+        candidates.append({
+            "chunk_id": doc.get("chunk_id", "unknown"),
+            "paper_id": doc.get("paper_id", "unknown"),
+            "paper_name": doc.get(
+                "paper_name",
+                doc.get("source", "unknown")
+            ),
+            "page": doc.get("page", "?"),
+            "section": doc.get("section", ""),
+            "text": text,
+            "similarity": score,
+            "keyword_overlap": overlap,
+            "score": score,
+        })
+
+    candidates.sort(
+        key=lambda item: item["score"],
+        reverse=True
+    )
+
+    selected = []
+    seen_pages = {}
+
+    for item in candidates:
+        page_key = (
+            item["paper_name"],
+            item["page"],
+        )
+
+        count = seen_pages.get(page_key, 0)
+
+        if count >= 2:
+            continue
+
+        selected.append(item)
+        seen_pages[page_key] = count + 1
+
+        if len(selected) >= top_k:
+            break
+
+    return selected
+
+
 def retrieve_chunks_for_paper(
     question,
     paper_id,
     top_k=TOP_K,
 ):
-    """Retrieve the most relevant chunks from one specific paper."""
+    """Retrieve relevant chunks from one paper without embeddings."""
 
-    model = get_embedding_model()
-    query_embedding = model.encode(
+    paper_docs = [
+        doc for doc in documents
+        if doc.get("paper_id") == paper_id
+    ]
+
+    return _keyword_retrieve(
         question,
-        normalize_embeddings=True,
+        paper_docs,
+        top_k,
     )
-    question_keywords = extract_keywords(question)
-    candidates = []
-
-    for doc in documents:
-        if doc.get("paper_id") != paper_id:
-            continue
-
-        doc_embedding = np.asarray(
-            doc.get("embedding", []),
-            dtype=np.float32,
-        )
-        norm = np.linalg.norm(doc_embedding)
-        if norm == 0:
-            continue
-
-        similarity = float(np.dot(query_embedding, doc_embedding / norm))
-        overlap = keyword_overlap(question_keywords, doc.get("text", ""))
-
-        candidates.append({
-            "chunk_id": doc.get("chunk_id", "unknown"),
-            "paper_id": doc.get("paper_id", paper_id),
-            "paper_name": doc.get("paper_name", "unknown"),
-            "page": doc.get("page", "?"),
-            "section": doc.get("section", ""),
-            "text": doc.get("text", ""),
-            "similarity": similarity,
-            "keyword_overlap": overlap,
-            "score": 0.80 * similarity + 0.20 * overlap,
-        })
-
-    candidates.sort(key=lambda item: item["score"], reverse=True)
-    return candidates[:top_k]
 
 
 def retrieve_chunks(
@@ -509,209 +653,16 @@ def retrieve_chunks(
     top_k=TOP_K,
 ):
     """
-    Retrieve relevant research-paper chunks.
+    Lightweight retrieval for low-memory deployment.
 
-    Semantic similarity is the primary signal.
-
-    A small keyword-overlap score is used as a secondary
-    reranking signal.
+    Uses keyword overlap instead of SentenceTransformer embeddings.
     """
 
-    # --------------------------------------------------------
-    # LOAD EMBEDDING MODEL ONLY WHEN NEEDED
-    # --------------------------------------------------------
-
-    model = get_embedding_model()
-
-
-    # --------------------------------------------------------
-    # CREATE QUERY EMBEDDING
-    # --------------------------------------------------------
-
-    query_embedding = model.encode(
+    return _keyword_retrieve(
         question,
-        normalize_embeddings=True,
+        documents,
+        top_k,
     )
-
-
-    question_keywords = extract_keywords(
-        question
-    )
-
-
-    candidates = []
-
-
-    # ========================================================
-    # SEMANTIC RETRIEVAL
-    # ========================================================
-
-    for doc in documents:
-
-        doc_embedding = np.asarray(
-            doc["embedding"],
-            dtype=np.float32,
-        )
-
-
-        norm = np.linalg.norm(
-            doc_embedding
-        )
-
-
-        if norm == 0:
-
-            continue
-
-
-        doc_embedding = (
-            doc_embedding / norm
-        )
-
-
-        similarity = float(
-            np.dot(
-                query_embedding,
-                doc_embedding,
-            )
-        )
-
-
-        candidates.append(
-            {
-                "chunk_id": doc.get(
-                    "chunk_id",
-                    "unknown",
-                ),
-
-                "paper_id": doc.get(
-                    "paper_id",
-                    "unknown",
-                ),
-
-                "paper_name": doc.get(
-                    "paper_name",
-                    doc.get(
-                        "source",
-                        "unknown",
-                    ),
-                ),
-
-                "page": doc.get(
-                    "page",
-                    "?",
-                ),
-
-                "section": doc.get(
-                    "section",
-                    "",
-                ),
-
-                "text": doc.get(
-                    "text",
-                    "",
-                ),
-
-                "similarity": similarity,
-            }
-        )
-
-
-    # ========================================================
-    # INITIAL CANDIDATE SELECTION
-    # ========================================================
-
-    candidates.sort(
-        key=lambda item: item["similarity"],
-        reverse=True,
-    )
-
-
-    candidates = candidates[
-        :RETRIEVAL_K
-    ]
-
-
-    # ========================================================
-    # RERANKING
-    # ========================================================
-
-    for item in candidates:
-
-        overlap = keyword_overlap(
-            question_keywords,
-            item["text"],
-        )
-
-
-        item["keyword_overlap"] = (
-            overlap
-        )
-
-
-        # Semantic similarity remains dominant.
-        item["score"] = (
-            0.80 * item["similarity"]
-            + 0.20 * overlap
-        )
-
-
-    candidates.sort(
-        key=lambda item: item["score"],
-        reverse=True,
-    )
-
-
-    # ========================================================
-    # DIVERSITY FILTERING
-    # ========================================================
-
-    selected = []
-
-    seen_pages = {}
-
-
-    for item in candidates:
-
-        paper = item["paper_name"]
-
-        page = item["page"]
-
-
-        page_key = (
-            paper,
-            page,
-        )
-
-
-        page_count = seen_pages.get(
-            page_key,
-            0,
-        )
-
-
-        # Maximum two chunks from one page.
-        if page_count >= 2:
-
-            continue
-
-
-        selected.append(
-            item
-        )
-
-
-        seen_pages[page_key] = (
-            page_count + 1
-        )
-
-
-        if len(selected) >= top_k:
-
-            break
-
-
-    return selected
 
 
 # ============================================================
